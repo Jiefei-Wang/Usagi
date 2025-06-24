@@ -26,8 +26,13 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.Vector;
-import java.util.concurrent.ForkJoinPool;
+import java.util.Map;
 
+import java.util.Map.Entry;
+import java.util.concurrent.ForkJoinPool;
+import java.util.Collection;
+import java.util.stream.Collectors;
+import javax.swing.SwingUtilities;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -46,12 +51,15 @@ import javax.swing.table.TableModel;
 import org.ohdsi.usagi.CodeMapping;
 import org.ohdsi.usagi.CodeMapping.MappingStatus;
 import org.ohdsi.usagi.MappingTarget;
+import org.ohdsi.usagi.UsagiSearchEngine;
 import org.ohdsi.usagi.SourceCode;
 import org.ohdsi.usagi.UsagiSearchEngine.ScoredConcept;
 import org.ohdsi.utilities.ReadXlsxFile;
 import org.ohdsi.utilities.StringUtilities;
 import org.ohdsi.utilities.collections.Pair;
 import org.ohdsi.utilities.files.ReadCSVFile;
+import org.apache.lucene.queries.mlt.MoreLikeThis; 
+import java.util.LinkedHashMap;
 
 import static org.ohdsi.usagi.ui.DataChangeEvent.*;
 
@@ -391,76 +399,85 @@ public class ImportDialog extends JDialog {
 
 		public void run() {
 			try {
+				Global.usagiSearchEngine.clearSearchCache();
+				
 				Global.usagiSearchEngine.createDerivedIndex(sourceCodes, null);
 
-				boolean filterStandard = filterPanel.getFilterStandard();
-				Vector<String> filterConceptClasses = null;
-				if (filterPanel.getFilterByConceptClasses())
-					filterConceptClasses = filterPanel.getConceptClass();
-				Vector<String> filterVocabularies = null;
-				if (filterPanel.getFilterByVocabularies())
-					filterVocabularies = filterPanel.getVocabulary();
-				Vector<String> filterDomains = null;
-				if (filterPanel.getFilterByDomains())
-					filterDomains = filterPanel.getDomain();
+				boolean filterByAuto           = filterPanel.getFilterByAuto();
+				boolean filterStandard         = filterPanel.getFilterStandard();
+				Vector<String> filterDomains           = filterPanel.getFilterByDomains()
+					? filterPanel.getDomain()       : null;
+				Vector<String> filterConceptClasses    = filterPanel.getFilterByConceptClasses()
+					? filterPanel.getConceptClass() : null;
+				Vector<String> filterVocabularies      = filterPanel.getFilterByVocabularies()
+					? filterPanel.getVocabulary()   : null;
 				boolean includeSourceConcepts = filterPanel.getIncludeSourceTerms();
-				final Vector<String> filterConceptClassesFinal = filterConceptClasses;
-				final Vector<String> filterVocabulariesFinal = filterVocabularies;
-				final Vector<String> filterDomainsFinal = filterDomains;
-
 				Global.mapping.clear();
 
-				List<CodeMapping> globalMappingList = Collections.synchronizedList(Global.mapping);
-				Integer threadCount = Runtime.getRuntime().availableProcessors();
-				if (threadCount <= 0) {
-					threadCount = 1;
+				long t0 = System.nanoTime();
+				System.out.printf("Starting batchSearch with %d source codes...%n", sourceCodes.size());
+				Map<SourceCode, List<ScoredConcept>> allResults =
+					Global.usagiSearchEngine.batchSearch(
+						sourceCodes,
+						true,                 // useMlt
+						filterByAuto,
+						filterDomains,
+						filterConceptClasses,
+						filterVocabularies,
+						filterStandard,
+						includeSourceConcepts,
+						(done, total) -> progressBar.setValue(Math.round(100f * done / total))
+					);
+				double took = (System.nanoTime() - t0) / 1_000_000_000.0;
+				System.out.printf("Import + batchSearch cost %.2f seconds.%n", took);
+				System.out.println(">>> searchCache size = " + Global.usagiSearchEngine.getCacheSize());
+
+				// 5) convert results to CodeMapping
+				List<CodeMapping> newMappings = new ArrayList<>(allResults.size());
+				for (Map.Entry<SourceCode, List<ScoredConcept>> entry : allResults.entrySet()) {
+					CodeMapping cm = makeCodeMapping(entry);
+					newMappings.add(cm);
 				}
 
-				// Note: Lucene's and BerkeleyDB's search objects are thread safe, so do not need to be recreated for each thread.
-				ForkJoinPool forkJoinPool = new ForkJoinPool(threadCount);
-				forkJoinPool.submit(() -> sourceCodes.parallelStream().forEach(sourceCode -> {
-					Set<Integer> filterConceptIds = null;
-					if (filterPanel.getFilterByAuto())
-						filterConceptIds = sourceCode.sourceAutoAssignedConceptIds;
-					try {
-						CodeMapping codeMapping = new CodeMapping(sourceCode);
-						List<ScoredConcept> concepts = Global.usagiSearchEngine.search(sourceCode.sourceName, true, filterConceptIds, filterDomainsFinal,
-								filterConceptClassesFinal, filterVocabulariesFinal, filterStandard, includeSourceConcepts);
-						if (concepts.size() > 0) {
-							codeMapping.getTargetConcepts().add(new MappingTarget(concepts.get(0).concept, "<auto>"));
-							codeMapping.setMatchScore(concepts.get(0).matchScore);
-						} else {
-							codeMapping.setMatchScore(0);
-						}
-						codeMapping.setComment("");
-						codeMapping.setMappingStatus(MappingStatus.UNCHECKED);
-						if (sourceCode.sourceAutoAssignedConceptIds.size() == 1 && concepts.size() > 0) {
-							codeMapping.setMappingStatus(MappingStatus.AUTO_MAPPED_TO_1);
-						} else if (sourceCode.sourceAutoAssignedConceptIds.size() > 1 && concepts.size() > 0) {
-							codeMapping.setMappingStatus(MappingStatus.AUTO_MAPPED);
-						}
-						codeMapping.setEquivalence(CodeMapping.Equivalence.UNREVIEWED);
-						synchronized (globalMappingList) {
-							globalMappingList.add(codeMapping);
-							progressBar.setValue(Math.round(100 * globalMappingList.size() / sourceCodes.size()));
-						}
-					} catch (Exception e) {
-						System.out.println(e.toString());
-					}
-				})).get();
-				forkJoinPool.shutdown();
-				dialog.setVisible(false);
-				Global.applyPreviousMappingAction.setEnabled(true);
-				Global.saveAction.setEnabled(true);
-				Global.saveAsAction.setEnabled(true);
-				Global.exportAction.setEnabled(true);
-				Global.exportForReviewAction.setEnabled(true);
-				Global.exportCandidatesAction.setEnabled(true);
+
+				// 6) add mappings to Global.mapping
+				SwingUtilities.invokeLater(() -> {
+  					Global.mapping.addAll(newMappings);
+					Global.mapping.fireDataChanged(RESTRUCTURE_EVENT);
+					dialog.setVisible(false);
+					Global.applyPreviousMappingAction.setEnabled(true);
+					Global.saveAction.setEnabled(true);
+					Global.saveAsAction.setEnabled(true);
+					Global.exportAction.setEnabled(true);
+					Global.exportForReviewAction.setEnabled(true);
+					Global.exportCandidatesAction.setEnabled(true);
+				});
 			} catch (Exception e) {
 				JOptionPane.showMessageDialog(Global.frame, StringUtilities.wordWrap(e.getMessage(), 80), "Error", JOptionPane.ERROR_MESSAGE);
 			}
 		}
 	}
+
+	private CodeMapping makeCodeMapping(Map.Entry<SourceCode,List<ScoredConcept>> entry) {
+		SourceCode sc = entry.getKey();
+		List<ScoredConcept> candidates = entry.getValue();
+		CodeMapping cm = new CodeMapping(sc);
+		if (!candidates.isEmpty()) {
+			ScoredConcept top = candidates.get(0);
+			cm.getTargetConcepts().add(new MappingTarget(top.concept, "<auto>"));
+			cm.setMatchScore(top.matchScore);
+			cm.setMappingStatus(
+			sc.sourceAutoAssignedConceptIds.size() == 1
+				? MappingStatus.AUTO_MAPPED_TO_1
+				: MappingStatus.AUTO_MAPPED
+			);
+		} else {
+			cm.setMatchScore(0);
+			cm.setMappingStatus(MappingStatus.UNCHECKED);
+		}
+		cm.setEquivalence(CodeMapping.Equivalence.UNREVIEWED);
+		return cm;
+		}
 
 	private class TableModelWrapper implements TableModel {
 

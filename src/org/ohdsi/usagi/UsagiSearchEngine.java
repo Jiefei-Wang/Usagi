@@ -36,6 +36,18 @@ import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import java.util.Map;
+import java.util.LinkedHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 
 import org.apache.lucene.analysis.core.KeywordAnalyzer;
 import org.apache.lucene.document.Document;
@@ -70,6 +82,10 @@ import org.apache.lucene.util.Version;
 import org.ohdsi.usagi.ui.Global;
 import org.ohdsi.utilities.DirectoryUtilities;
 import org.ohdsi.utilities.StringUtilities;
+
+import javax.swing.SwingUtilities;
+
+
 
 /**
  * The Usagi search engine is used to find matching concepts for source terms. The search engine uses Lucene.
@@ -107,6 +123,37 @@ public class UsagiSearchEngine {
 		textVectorField.setStored(true);
 		textVectorField.freeze();
 		return textVectorField;
+	}
+	
+
+	// Cache to speed up repeated searches
+	private final ConcurrentMap<String,List<ScoredConcept>> searchCache = new ConcurrentHashMap<>();
+	/**
+	 * Builds a unique cache key based on search parameters.
+	 */
+	private String buildCacheKey(String searchTerm,
+								boolean useMlt,
+								Collection<Integer> filterConceptIds,
+								Vector<String> filterDomains,
+								Vector<String> filterConceptClasses,
+								Vector<String> filterVocabularies,
+								boolean filterStandard,
+								boolean includeSourceConcepts) {
+		StringBuilder key = new StringBuilder();
+		key.append(searchTerm).append('|').append(useMlt);
+		if (filterConceptIds != null)       key.append('|').append(filterConceptIds);
+		if (filterDomains != null)          key.append('|').append(filterDomains);
+		if (filterConceptClasses != null)   key.append('|').append(filterConceptClasses);
+		if (filterVocabularies != null)     key.append('|').append(filterVocabularies);
+		key.append('|').append(filterStandard)
+		.append('|').append(includeSourceConcepts);
+		return key.toString();
+	}
+
+	public void clearSearchCache() {
+		synchronized (searchCache) {
+			searchCache.clear();
+		}
 	}
 
 	public void createNewMainIndex() {
@@ -278,6 +325,8 @@ public class UsagiSearchEngine {
 
 	}
 
+	// add batch search method to allow for caching
+
 	public List<ScoredConcept> search(String searchTerm, boolean useMlt, Collection<Integer> filterConceptIds, Vector<String> filterDomains, Vector<String> filterConceptClasses,
 									  Vector<String> filterVocabularies, boolean filterStandard, boolean includeSourceConcepts) {
 		List<ScoredConcept> results = new ArrayList<ScoredConcept>();
@@ -376,6 +425,113 @@ public class UsagiSearchEngine {
 		return results;
 	}
 
+
+	public Map<SourceCode, List<ScoredConcept>> batchSearch(
+        List<SourceCode> sourceCodes,
+        boolean useMlt,
+        boolean filterByAuto,
+        Vector<String> filterDomains,
+        Vector<String> filterConceptClasses,
+        Vector<String> filterVocabularies,
+        boolean filterStandard,
+        boolean includeSourceConcepts,
+		BiConsumer<Integer,Integer> progressCallback) throws Exception {
+
+		int total = sourceCodes.size();
+		if (total == 0) {
+			return new LinkedHashMap<>();
+		}
+
+		AtomicInteger doneCounter = new AtomicInteger(0);
+
+		// 1) Set up executor
+		int threads = Runtime.getRuntime().availableProcessors();
+		ExecutorService executor = Executors.newFixedThreadPool(threads);
+
+		try {
+			// 2) Partition into chunks
+			int chunkSize = (total + threads - 1) / threads;
+			List<Future<Map<SourceCode, List<ScoredConcept>>>> futures = new ArrayList<>();
+
+			for (int i = 0; i < total; i += chunkSize) {
+				final int start = i;
+				final int end   = Math.min(total, i + chunkSize);
+				futures.add(executor.submit(() -> {
+					Map<SourceCode, List<ScoredConcept>> partial = new LinkedHashMap<>();
+					for (int j = start; j < end; j++) {
+						SourceCode sc = sourceCodes.get(j);
+
+						// 逐条过滤: each record uses its own auto-assigned IDs
+						final Collection<Integer> filterConceptIdsLocal =
+							filterByAuto
+							? sc.sourceAutoAssignedConceptIds
+							: null;
+
+						// 2) Build your cache key using that final var:
+						// Note: Using sc.getId() to ensure uniqueness in case of multiple SourceCodes with the same sourceName
+						// current the cache key is based on only the sourcecode
+						String key = sc.getId() + "|" + buildCacheKey(
+							sc.sourceName, useMlt,
+							filterConceptIdsLocal,
+							filterDomains,
+							filterConceptClasses,
+							filterVocabularies,
+							filterStandard,
+							includeSourceConcepts
+						);
+
+
+						// 3) Now the lambda can capture the final var cleanly:
+						List<ScoredConcept> hits = searchCache.computeIfAbsent(key, k -> {
+							try {
+								return search(
+									sc.sourceName, useMlt,
+									filterConceptIdsLocal,
+									filterDomains,
+									filterConceptClasses,
+									filterVocabularies,
+									filterStandard,
+									includeSourceConcepts
+								);
+							} catch (Exception ex) {
+								throw new RuntimeException(ex);
+							}
+						});
+
+						int done = doneCounter.incrementAndGet();
+						if (progressCallback != null) {
+							// 回到 EDT 更新 UI
+							SwingUtilities.invokeLater(() ->
+								progressCallback.accept(done, total)
+							);
+						
+						}
+
+						partial.put(sc, hits);
+					}
+					
+					return partial;
+				}));
+			}
+
+			// 4) Merge results in submission order
+			System.out.println("Waiting for " + futures.size() + " tasks to complete...");
+			Map<SourceCode, List<ScoredConcept>> allResults = new LinkedHashMap<>();
+			for (Future<Map<SourceCode, List<ScoredConcept>>> f : futures) {
+				allResults.putAll(f.get());
+			}
+			System.out.println(">>> searchCache size = " + searchCache.size());
+			return allResults;
+
+		} finally {
+			executor.shutdown();
+		}
+	}
+
+	public int getCacheSize() {
+  			return searchCache.size();
+	}
+
 	private void removeDuplicateConcepts(List<ScoredConcept> results) {
 		Set<Integer> seenConceptIds = new HashSet<Integer>();
 		Iterator<ScoredConcept> iterator = results.iterator();
@@ -402,6 +558,35 @@ public class UsagiSearchEngine {
 			}
 		});
 	}
+
+
+	public void preheatCache(
+    List<SourceCode> sourceCodes,
+    boolean useMlt,
+    boolean filterByAuto,
+    Vector<String> filterDomains,
+    Vector<String> filterConceptClasses,
+    Vector<String> filterVocabularies,
+    boolean filterStandard,
+    boolean includeSourceConcepts
+	) {
+		try {
+			batchSearch(
+				sourceCodes,      
+				useMlt,
+				filterByAuto,
+				filterDomains,
+				filterConceptClasses,
+				filterVocabularies,
+				filterStandard,
+				includeSourceConcepts,
+				null
+				);
+		} catch (Exception ex) {
+			System.err.println("Preheat cache failed: " + ex.getMessage());
+		}
+}
+
 
 	/**
 	 * Lucene's matching score does some weird things: it is not normalized (the value can be greater than 1), and not all tokens are included in the

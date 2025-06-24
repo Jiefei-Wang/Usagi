@@ -31,6 +31,7 @@ import javax.swing.table.AbstractTableModel;
 import javax.swing.table.TableRowSorter;
 
 import org.ohdsi.usagi.CodeMapping;
+import org.ohdsi.usagi.SourceCode;
 import org.ohdsi.usagi.CodeMapping.MappingStatus;
 import org.ohdsi.usagi.Concept;
 import org.ohdsi.usagi.MappingTarget;
@@ -558,11 +559,32 @@ public class MappingDetailPanel extends JPanel implements CodeSelectedListener, 
 			boolean includeSourceConcepts = filterPanel.getIncludeSourceTerms();
 
 			if (Global.usagiSearchEngine.isOpenForSearching()) {
-				List<ScoredConcept> searchResults = Global.usagiSearchEngine.search(query, true, filterConceptIds, filterDomains, filterConceptClasses,
-						filterVocabularies, filterStandard, includeSourceConcepts);
-
+				SourceCode sc = codeMapping.getSourceCode();
+				List<ScoredConcept> searchResults;
+				try {
+					Map<SourceCode,List<ScoredConcept>> all =
+					Global.usagiSearchEngine.batchSearch(
+						Collections.singletonList(sc),
+						true,
+						filterPanel.getFilterByAuto(),
+						filterPanel.getFilterByDomains()           ? filterPanel.getDomain()           : null,
+						filterPanel.getFilterByConceptClasses()    ? filterPanel.getConceptClass()     : null,
+						filterPanel.getFilterByVocabularies()      ? filterPanel.getVocabulary()       : null,
+						filterPanel.getFilterStandard(),
+						filterPanel.getIncludeSourceTerms(),
+						null
+					);
+					searchResults = all.get(sc);
+				} catch (Exception e) {
+					e.printStackTrace();
+            		searchResults = Collections.emptyList();
+				}
 				searchTableModel.setScoredConcepts(searchResults);
-				searchTable.scrollRectToVisible(new Rectangle(searchTable.getCellRect(0, 0, true)));
+				if (!searchResults.isEmpty()) {
+					searchTable.scrollRectToVisible(new Rectangle(searchTable.getCellRect(0, 0, true))
+				);
+        		}
+				
 			}
 			Global.statusBar.setSearching(false);
 		}

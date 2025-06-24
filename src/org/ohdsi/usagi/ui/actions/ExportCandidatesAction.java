@@ -19,6 +19,13 @@ import org.ohdsi.usagi.ui.Global;
 import org.ohdsi.utilities.files.Row;
 import org.ohdsi.utilities.files.WriteCSVFileWithHeader;
 
+import java.util.Map;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.stream.Collectors;
+
+
 public class ExportCandidatesAction extends AbstractAction {
     private static final long serialVersionUID = 1L;
 
@@ -74,62 +81,124 @@ public class ExportCandidatesAction extends AbstractAction {
                 writer = new WriteCSVFileWithHeader(file.getAbsolutePath());
 
                 // 3. Write data using filters from exportFilterPanel
-                for (CodeMapping codeMappingEntry : Global.mapping) {
-                    SourceCode sourceCode = codeMappingEntry.getSourceCode();
+                // for (CodeMapping codeMappingEntry : Global.mapping) {
+                //     SourceCode sourceCode = codeMappingEntry.getSourceCode();
 
-                    // Get filter settings from the configured exportFilterPanel
-                    Set<Integer> conceptIdsForFilter = null;
-                    if (exportFilterPanel.getFilterByAuto()) {
-                        conceptIdsForFilter = sourceCode.sourceAutoAssignedConceptIds;
-                    }
-                    boolean standardFilter = exportFilterPanel.getFilterStandard();
-                    Vector<String> conceptClassesFilter = null;
-                    if (exportFilterPanel.getFilterByConceptClasses()) {
-                        conceptClassesFilter = exportFilterPanel.getConceptClass();
-                    }
-                    Vector<String> vocabulariesFilter = null;
-                    if (exportFilterPanel.getFilterByVocabularies()) {
-                        vocabulariesFilter = exportFilterPanel.getVocabulary();
-                    }
-                    Vector<String> domainsFilter = null;
-                    if (exportFilterPanel.getFilterByDomains()) {
-                        domainsFilter = exportFilterPanel.getDomain();
-                    }
-                    boolean includeSourceFilter = exportFilterPanel.getIncludeSourceTerms();
-                    boolean useMlt = true; // Default for search, can also be made a filter option if needed
+                //     // Get filter settings from the configured exportFilterPanel
+                //     Set<Integer> conceptIdsForFilter = null;
+                //     if (exportFilterPanel.getFilterByAuto()) {
+                //         conceptIdsForFilter = sourceCode.sourceAutoAssignedConceptIds;
+                //     }
+                //     boolean standardFilter = exportFilterPanel.getFilterStandard();
+                //     Vector<String> conceptClassesFilter = null;
+                //     if (exportFilterPanel.getFilterByConceptClasses()) {
+                //         conceptClassesFilter = exportFilterPanel.getConceptClass();
+                //     }
+                //     Vector<String> vocabulariesFilter = null;
+                //     if (exportFilterPanel.getFilterByVocabularies()) {
+                //         vocabulariesFilter = exportFilterPanel.getVocabulary();
+                //     }
+                //     Vector<String> domainsFilter = null;
+                //     if (exportFilterPanel.getFilterByDomains()) {
+                //         domainsFilter = exportFilterPanel.getDomain();
+                //     }
+                //     boolean includeSourceFilter = exportFilterPanel.getIncludeSourceTerms();
+                //     boolean useMlt = true; // Default for search, can also be made a filter option if needed
 
-                    List<ScoredConcept> candidates = Global.usagiSearchEngine.search(
-                            sourceCode.sourceName,
-                            useMlt,
-                            conceptIdsForFilter,
-                            domainsFilter,
-                            conceptClassesFilter,
-                            vocabulariesFilter,
-                            standardFilter,
-                            includeSourceFilter
-                    ); 
+
+                //     // use batch search engine to find candidates, use cache 
+                //    Map<SourceCode, List<ScoredConcept>> allResults =
+                //         Global.usagiSearchEngine.batchSearch(
+                //             sourceCodes,
+                //             useMlt,
+                //             filterConceptIds,
+                //             filterDomains,
+                //             filterConceptClasses,
+                //             filterVocabularies,
+                //             filterStandard,
+                //             includeSourceConcepts
+                //         );
+
+                //     if (candidates == null || candidates.isEmpty()) {
+                //         Row row = new Row();
+                //         row.add("source_code", sourceCode.sourceCode);
+                //         row.add("source_name", sourceCode.sourceName);
+                //         // Add other source code fields as needed
+                //         row.add("target_concept_id", "");
+                //         row.add("target_domain_id", "");
+                //         row.add("match_score", "");
+                //         writer.write(row);
+                //     } else {
+                //         for (ScoredConcept candidate : candidates) {
+                //             Row row = new Row();
+                //             row.add("source_code", sourceCode.sourceCode);
+                //             row.add("source_name", sourceCode.sourceName);
+                //             // Add other source code fields
+                //             row.add("target_concept_id", String.valueOf(candidate.concept.conceptId));
+                //             row.add("target_domain_id", candidate.concept.domainId);
+                //             row.add("match_score", String.valueOf(candidate.matchScore));
+                //             writer.write(row);
+                //         }
+                //     }
+                // }
+                List<SourceCode> sourceCodes = Global.mapping.stream()
+                                                .map(CodeMapping::getSourceCode)
+                                                .collect(Collectors.toList());
+                boolean useMlt               = true;
+                boolean filterByAuto         = exportFilterPanel.getFilterByAuto();
+                Vector<String> domainsFilter = exportFilterPanel.getFilterByDomains()
+                    ? exportFilterPanel.getDomain()
+                    : null;
+                Vector<String> classesFilter = exportFilterPanel.getFilterByConceptClasses()
+                    ? exportFilterPanel.getConceptClass()
+                    : null;
+                Vector<String> vocabsFilter  = exportFilterPanel.getFilterByVocabularies()
+                    ? exportFilterPanel.getVocabulary()
+                    : null;
+                boolean standardFilter       = exportFilterPanel.getFilterStandard();
+                boolean includeSourceFilter  = exportFilterPanel.getIncludeSourceTerms();
+
+                Map<SourceCode, List<ScoredConcept>> allResults =
+                    Global.usagiSearchEngine.batchSearch(
+                    sourceCodes,
+                    useMlt,
+                    filterByAuto,
+                    domainsFilter,
+                    classesFilter,
+                    vocabsFilter,
+                    standardFilter,
+                    includeSourceFilter,
+                    null
+                    );
+
+                for (CodeMapping mapping : Global.mapping) {
+                    SourceCode sc = mapping.getSourceCode();
+                    List<ScoredConcept> candidates = allResults.get(sc);
+
                     if (candidates == null || candidates.isEmpty()) {
+                        // 无匹配时输出一行空结果
                         Row row = new Row();
-                        row.add("source_code", sourceCode.sourceCode);
-                        row.add("source_name", sourceCode.sourceName);
-                        // Add other source code fields as needed
+                        row.add("source_code", sc.sourceCode);
+                        row.add("source_name", sc.sourceName);
                         row.add("target_concept_id", "");
                         row.add("target_domain_id", "");
                         row.add("match_score", "");
                         writer.write(row);
-                    } else {
-                        for (ScoredConcept candidate : candidates) {
-                            Row row = new Row();
-                            row.add("source_code", sourceCode.sourceCode);
-                            row.add("source_name", sourceCode.sourceName);
-                            // Add other source code fields
-                            row.add("target_concept_id", String.valueOf(candidate.concept.conceptId));
-                            row.add("target_domain_id", candidate.concept.domainId);
-                            row.add("match_score", String.valueOf(candidate.matchScore));
-                            writer.write(row);
+                    }
+                    else {
+                        // 有多个候选时，每个候选一行
+                        for (ScoredConcept cand : candidates) {
+                        Row row = new Row();
+                        row.add("source_code", sc.sourceCode);
+                        row.add("source_name", sc.sourceName);
+                        row.add("target_concept_id", String.valueOf(cand.concept.conceptId));
+                        row.add("target_domain_id", cand.concept.domainId);
+                        row.add("match_score", String.valueOf(cand.matchScore));
+                        writer.write(row);
                         }
                     }
-                }
+                    }
+
                 JOptionPane.showMessageDialog(Global.frame, "Export completed successfully to " + file.getAbsolutePath(), "Export Candidates", JOptionPane.INFORMATION_MESSAGE);
             } catch (Exception ex) {
                 JOptionPane.showMessageDialog(Global.frame, "Error during export: " + ex.getMessage(), "Export Error", JOptionPane.ERROR_MESSAGE);
